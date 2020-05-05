@@ -1,0 +1,6 @@
+[submodule "scad/BOSL"]
+	path = scad/lib/BOSL
+	url = https://github.com/revarbat/BOSL
+[submodule "scad/lib/nutsnbolts"]
+	path = scad/lib/nutsnbolts
+	url = https://github.com/JohK/nutsnbolts.git
