@@ -1,57 +1,140 @@
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use crate::serial::devices::keypad::SerialKeypad;
+use tokio::sync::broadcast::Receiver;
+
+use crate::serial::devices::keypad::{self, Backlight, EventType, SerialKeypad};
 
 const SYSTEM_OWNER: &'static str = "TIGER SECURITY";
 
+#[derive(PartialEq)]
 enum DisplayMode {
     Idle,
+    CodeEntry,
+    Menu,
 }
 
 pub struct KeypadManager {
     keypad: Arc<SerialKeypad>,
 
-    state: DisplayMode,
+    state: Arc<Mutex<DisplayMode>>,
+    accumulator: Arc<Mutex<Option<String>>>,
+}
+
+async fn process_events(
+    mut event_ch: Receiver<keypad::Event>,
+    state: Arc<Mutex<DisplayMode>>,
+    acc: Arc<Mutex<Option<String>>>,
+) {
+    loop {
+        let ev = event_ch.recv().await;
+
+        let mut state = state.lock().unwrap();
+        let mut acc = acc.lock().unwrap();
+
+        match ev {
+            Ok(event) => match event.0 {
+                EventType::KeyPress(key) => {
+                    if *state == DisplayMode::Idle && key != 'X' {
+                        let mut s = String::with_capacity(16);
+                        s.push(key);
+
+                        *state = DisplayMode::CodeEntry;
+                        *acc = Some(s);
+                    } else if *state == DisplayMode::CodeEntry {
+                        match key {
+                            'X' => {
+                                *state = DisplayMode::Idle;
+                                *acc = None;
+                            }
+                            x => acc.as_mut().unwrap().push(x),
+                        }
+                    } else if *state == DisplayMode::Menu && key == 'X' {
+                        *state = DisplayMode::Idle;
+                    }
+                }
+            },
+            Err(e) => panic!("error receiving event: {}", e),
+        }
+    }
 }
 
 impl KeypadManager {
     pub fn new(keypad: Arc<SerialKeypad>) -> KeypadManager {
         KeypadManager {
             keypad,
-            state: DisplayMode::Idle,
+            state: Arc::new(Mutex::new(DisplayMode::Idle)),
+            accumulator: Arc::new(Mutex::new(None)),
         }
     }
 
     pub async fn run(&mut self) -> Result<(), Box<dyn Error + Sync + Send>> {
         {
-            let keypad = self.keypad.clone();
-            tokio::spawn(async move { keypad.as_ref().update_worker().await });
+            let event_ch = self.keypad.subscribe_events();
+            let state = self.state.clone();
+            let acc = self.accumulator.clone();
+
+            tokio::spawn(async move { process_events(event_ch, state, acc).await });
         }
 
         loop {
-            let next_wakeup = match self.state {
-                DisplayMode::Idle => {
-                    let mut banner = format!("{:<16}", SYSTEM_OWNER);
-                    if self.keypad.is_tamper() {
-                        banner.pop();
-                        banner.push('T');
+            {
+                let mut state = self.state.lock().unwrap();
+
+                match *state {
+                    DisplayMode::Idle => {
+                        let mut banner = format!("{:<16}", SYSTEM_OWNER);
+                        if self.keypad.is_tamper() {
+                            banner.pop();
+                            banner.push('T');
+                        }
+
+                        self.keypad.mutate_state(|state| {
+                            state.backlight = Backlight::Off;
+                            state.blink = false;
+                            state.screen.lines = [
+                                banner,
+                                chrono::Local::now()
+                                    .format("%a %_d %b %H:%M")
+                                    .to_string()
+                                    .to_uppercase(),
+                            ]
+                        });
                     }
+                    DisplayMode::CodeEntry => {
+                        let acc = self.accumulator.lock().unwrap();
 
-                    self.keypad.mutate_state(|state| {
-                        state.screen.lines = [
-                            banner,
-                            chrono::Local::now()
-                                .format("%a %_d %b %H:%M")
-                                .to_string()
-                                .to_uppercase(),
-                        ]
-                    });
+                        if acc.as_ref().is_some_and(|data| data == "1234E") {
+                            *state = DisplayMode::Menu;
+                        } else {
+                            let line1 = if acc.is_some() {
+                                acc.clone().unwrap()
+                            } else {
+                                "".to_string()
+                            };
 
-                    Duration::from_millis(250)
+                            self.keypad.mutate_state(|state| {
+                                state.backlight = Backlight::On;
+                                state.blink = false;
+                                state.screen.lines = [line1, "".to_string()];
+                            });
+                        }
+                    }
+                    DisplayMode::Menu => {
+                        self.keypad.mutate_state(|state| {
+                            state.backlight = Backlight::On;
+                            state.blink = true;
+                            state.screen.lines =
+                                ["10 = SETTING".to_string(), "[ent] to select".to_string()];
+                        });
+                    }
                 }
             };
 
-            tokio::time::sleep(next_wakeup).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
 }

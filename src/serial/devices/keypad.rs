@@ -37,6 +37,14 @@ impl Default for State {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum EventType {
+    KeyPress(char),
+}
+
+#[derive(Clone, Debug)]
+pub struct Event(pub EventType);
+
 /// A toggleable flag that returns either the constant B or 0x0, and is toggled each time it is
 /// queried. This is used in updates to the keypad to acknowledge events or convey updates with
 /// a determination of whether the ack/update is fresh or repeated.
