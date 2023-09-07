@@ -17,10 +17,12 @@ fn key_to_char(idx: u8) -> char {
 
 #[derive(Clone, Debug)]
 pub struct State {
-    pub backlight: Backlight,       // LCD backlight
-    pub beeper: Beeper,             // keypad sounder
-    pub key_clicks: KeyClicks,      // chirp when pressing keys
-    pub screen: KeypadDisplayState, // contents of the display
+    pub backlight: Backlight, // LCD backlight
+    pub beeper: Beeper,       // keypad sounder
+    // Updated as part of the screen command, but not part of display state; sent as flags.
+    pub blink: bool,           // LED blink state (true = flash, false = steady).
+    pub key_clicks: KeyClicks, // chirp when pressing keys
+    pub screen: display::KeypadDisplayState, // contents of the display
 }
 
 impl Default for State {
@@ -29,7 +31,8 @@ impl Default for State {
             backlight: Backlight::Off,
             beeper: Beeper::Off,
             key_clicks: KeyClicks::Off,
-            screen: KeypadDisplayState::default(),
+            screen: display::KeypadDisplayState::default(),
+            blink: false,
         }
     }
 }
@@ -189,11 +192,12 @@ impl SerialKeypad {
                 Command::KeyClicks,
                 Some(vec![current_state.key_clicks.into()]),
             )
-        } else if updates.send_screen || current_state.screen != last_state.screen {
-            updates.send_screen = false;
-
+        } else if updates.send_screen
+            || current_state.screen != last_state.screen
+            // Blink is not captured on screen because it complicates the diff algorithm.
+            || current_state.blink != last_state.blink
+        {
             let screen = &current_state.screen;
-            last_state.screen = screen.clone();
 
             // TODO investigate what 0x1F command does in screen updates
 
@@ -205,27 +209,19 @@ impl SerialKeypad {
                 } else {
                     0
                 }
-                | if screen.blink { 0x08 } else { 0 };
+                | if current_state.blink { 0x08 } else { 0 };
 
-            let mut data = vec![
-                display_flags,
-                ScreenOpCodes::DISPLAY_RESET,
-                ScreenOpCodes::CURSOR_FIRST_LINE,
-                ScreenOpCodes::CURSOR_HIDDEN,
-            ];
-            data.extend(format!("{:<16}", screen.lines[0]).chars().map(|x| x as u8));
-            data.push(ScreenOpCodes::CURSOR_SECOND_LINE);
-            data.extend(format!("{:<16}", screen.lines[1]).chars().map(|x| x as u8));
+            let mut data = vec![display_flags];
+            data.extend(if updates.send_screen {
+                // Send the full update when sending is forced, to avoid any sync issues between
+                // our state and the screen state.
+                screen.full_update()
+            } else {
+                screen.strategic_update(&last_state.screen)
+            });
 
-            if let Some(cursor_style) = match screen.cursor_style {
-                CursorStyle::Block => Some(ScreenOpCodes::CURSOR_BLOCK_STYLE),
-                CursorStyle::Underline => Some(ScreenOpCodes::CURSOR_UNDERLINE_STYLE),
-                _ => None,
-            } {
-                data.push(cursor_style);
-            }
-
-            data.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, screen.cursor_position]);
+            updates.send_screen = false;
+            last_state.screen = screen.clone();
 
             (Command::Screen, Some(data))
         } else if updates.send_key_ack {
@@ -521,97 +517,204 @@ impl From<Beeper> for Vec<u8> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CursorStyle {
-    None,
-    Block,
-    Underline,
-}
+mod display {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum CursorStyle {
+        None,
+        Block,
+        Underline,
+    }
 
-impl From<CursorStyle> for u8 {
-    fn from(value: CursorStyle) -> Self {
-        match value {
-            CursorStyle::None => 0x07,
-            CursorStyle::Block => 0x06,
-            CursorStyle::Underline => 0x10,
+    impl From<CursorStyle> for u8 {
+        fn from(value: CursorStyle) -> Self {
+            match value {
+                CursorStyle::None => 0x07,
+                CursorStyle::Block => 0x06,
+                CursorStyle::Underline => 0x10,
+            }
         }
     }
-}
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct KeypadDisplayState {
-    pub lines: [String; 2],
-    pub cursor_position: u8,
-    pub cursor_style: CursorStyle,
-    /// LED blink status, i.e. whether it is flashing or not. Odd to be part of the display
-    /// updates, but that's where the command to control this is represented.
-    pub blink: bool,
-}
+    fn pad_string_iterator<'a>(length: usize, s: &'a str) -> impl Iterator<Item = char> + 'a {
+        s.chars().chain(std::iter::repeat(' ')).take(length)
+    }
 
-impl Default for KeypadDisplayState {
-    fn default() -> Self {
-        KeypadDisplayState {
-            lines: [
-                String::from("    ********    "),
-                String::from("Panel booting up"),
-            ],
-            cursor_position: 0x0,
-            cursor_style: CursorStyle::None,
-            blink: false,
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct KeypadDisplayState {
+        pub lines: [String; 2],
+        pub cursor_position: u8,
+        pub cursor_style: CursorStyle,
+    }
+
+    impl KeypadDisplayState {
+        pub(super) fn strategic_update(&self, from: &KeypadDisplayState) -> Vec<u8> {
+            // Update methodology:
+            //
+            // 1. If any field other than lines is changed, send the full update.
+            // 2. Otherwise, compute an "update score" as 2*discrete_blocks + chars_diff where
+            //    discrete_blocks is the number of separate blocks of changes, and chars_diff is
+            //    the total number of characters that differ between old and new states. If this
+            //    value is greater than 20, send the full screen state.
+            //
+            //    (2*discrete_blocks is to allow for the cursor control command to move the cursor,
+            //    which adds overhead.)
+            if self.cursor_position != from.cursor_position
+                || self.cursor_style != from.cursor_style
+            {
+                self.full_update()
+            } else if self.update_score(from) <= 20 {
+                self.partial_update(from)
+            } else {
+                self.full_update()
+            }
+        }
+
+        pub fn full_update(&self) -> Vec<u8> {
+            let mut data = vec![
+                ScreenOpCodes::DISPLAY_RESET,
+                ScreenOpCodes::CURSOR_FIRST_LINE,
+                ScreenOpCodes::CURSOR_HIDDEN,
+            ];
+            data.extend(format!("{:<16}", self.lines[0]).chars().map(|x| x as u8));
+            data.push(ScreenOpCodes::CURSOR_SECOND_LINE);
+            data.extend(format!("{:<16}", self.lines[1]).chars().map(|x| x as u8));
+
+            if let Some(cursor_style) = match self.cursor_style {
+                CursorStyle::Block => Some(ScreenOpCodes::CURSOR_BLOCK_STYLE),
+                CursorStyle::Underline => Some(ScreenOpCodes::CURSOR_UNDERLINE_STYLE),
+                _ => None,
+            } {
+                data.push(cursor_style);
+            }
+
+            data.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, self.cursor_position]);
+
+            data
+        }
+
+        fn partial_update(&self, from: &KeypadDisplayState) -> Vec<u8> {
+            let from = from.lines.iter().map(|line| pad_string_iterator(16, &line));
+            let to = self.lines.iter().map(|line| pad_string_iterator(16, &line));
+
+            let mut data = vec![];
+            let mut cursor_position = None;
+
+            for (i, (from, to)) in from.zip(to).enumerate() {
+                for (j, (a, b)) in from.zip(to).enumerate() {
+                    let offset = i * 0x40 + j;
+
+                    if a != b {
+                        if cursor_position.is_none()
+                            || cursor_position.is_some_and(|pos| pos != offset)
+                        {
+                            data.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, offset as u8]);
+                        }
+
+                        data.push(b as u8);
+                        cursor_position = Some(offset + 1);
+                    }
+                }
+            }
+
+            // Always reset the cursor to the expected position.
+            //
+            // TODO turn the cursor_position into an Option so this can be skipped when the cursor
+            // is able to float.
+            data.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, self.cursor_position]);
+
+            data
+        }
+
+        fn update_score(&self, from: &KeypadDisplayState) -> usize {
+            let from_iter = pad_string_iterator(16, from.lines[0].as_str())
+                .chain(pad_string_iterator(16, from.lines[1].as_str()));
+            let to_iter = pad_string_iterator(16, self.lines[0].as_str())
+                .chain(pad_string_iterator(16, self.lines[1].as_str()));
+
+            let mut discrete_blocks = 0;
+            let mut chars_diff = 0;
+            let mut in_block = false;
+
+            for (a, b) in from_iter.zip(to_iter) {
+                if a != b {
+                    chars_diff += 1;
+                    if !in_block {
+                        discrete_blocks += 1;
+                        in_block = true;
+                    }
+                } else {
+                    in_block = false;
+                }
+            }
+
+            2 * discrete_blocks + chars_diff
         }
     }
-}
 
-pub struct ScreenOpCodes;
+    impl Default for KeypadDisplayState {
+        fn default() -> Self {
+            KeypadDisplayState {
+                lines: [
+                    String::from("    ********    "),
+                    String::from("Panel booting up"),
+                ],
+                cursor_position: 0x0,
+                cursor_style: CursorStyle::None,
+            }
+        }
+    }
 
-impl ScreenOpCodes {
-    // Cursor Positioning Operations
-    pub const CURSOR_FIRST_LINE: u8 = 0x01;
-    pub const CURSOR_SECOND_LINE: u8 = 0x02;
-    pub const CURSOR_SEEK_BYTE: u8 = 0x03;
-    pub const CURSOR_LEFT_NO_ERASE: u8 = 0x15;
-    pub const CURSOR_RIGHT_NO_ERASE: u8 = 0x16;
+    pub struct ScreenOpCodes;
 
-    // Scroll Operations
-    pub const SCROLL_LEFT: u8 = 0x04;
-    pub const SCROLL_RIGHT: u8 = 0x05;
+    impl ScreenOpCodes {
+        // Cursor Positioning Operations
+        pub const CURSOR_FIRST_LINE: u8 = 0x01;
+        pub const CURSOR_SECOND_LINE: u8 = 0x02;
+        pub const CURSOR_SEEK_BYTE: u8 = 0x03;
+        pub const CURSOR_LEFT_NO_ERASE: u8 = 0x15;
+        pub const CURSOR_RIGHT_NO_ERASE: u8 = 0x16;
 
-    // Cursor Style Operations
-    pub const CURSOR_BLOCK_STYLE: u8 = 0x06;
-    pub const CURSOR_HIDDEN: u8 = 0x07;
-    pub const CURSOR_UNDERLINE_STYLE: u8 = 0x10;
+        // Scroll Operations
+        pub const SCROLL_LEFT: u8 = 0x04;
+        pub const SCROLL_RIGHT: u8 = 0x05;
 
-    // Text Manipulation
-    pub const BACKSPACE: u8 = 0x14;
+        // Cursor Style Operations
+        pub const CURSOR_BLOCK_STYLE: u8 = 0x06;
+        pub const CURSOR_HIDDEN: u8 = 0x07;
+        pub const CURSOR_UNDERLINE_STYLE: u8 = 0x10;
 
-    // Display Operations
-    pub const DISPLAY_RESET: u8 = 0x17;
-    pub const FLASH_DISPLAY: u8 = 0x18;
-    pub const STOP_FLASHING: u8 = 0x19;
+        // Text Manipulation
+        pub const BACKSPACE: u8 = 0x14;
 
-    // 0x08 seems to print an uppercase A-ring (Å) and advance the cursor.
-    // 0x09 seems to print a lowercase
-    // 0xA6 to 0xAF appear to be symbols of another alphabet/script.
-    // 0XB1 to 0xDA are another script.
-    // 0xDC to 0xDE are another script.
-    // 0xE0 to 0xEF is assorted script, including a-umlaut, some low Greek, and integral
-    // 0xF0 to 0xFC is mostly more Greek.
+        // Display Operations
+        pub const DISPLAY_RESET: u8 = 0x17;
+        pub const FLASH_DISPLAY: u8 = 0x18;
+        pub const STOP_FLASHING: u8 = 0x19;
 
-    // Special Characters
-    pub const RIGHT_ARROW: u8 = 0x7E; // normal tilde in ASCII
-    pub const LEFT_ARROW: u8 = 0x7F; // normally unprintable DEL in ASCII
-    pub const WHITESPACE: u8 = 0xA0;
-    pub const LOWER_OPEN_FULL_STOP: u8 = 0xA1;
-    pub const TOP_LEFT_CORNER: u8 = 0xA2; // similar to Unicode U+231C (⌜)
-    pub const BOTTOM_RIGHT_CORNER: u8 = 0xA3; // similar to Unicode U+231F (⌟)
-    pub const UNFILLED_BASELINE_SQUARE_UNFILLED: u8 = 0xA4; // similar to Unicode U+25AB (▫)
-    pub const SQUARE_BULLET: u8 = 0xA5; // i.e. small filled mid-aligned square, Unicode U+25AA (▪)
-    pub const EN_DASH: u8 = 0xB0;
-    pub const LARGE_FULL_HEIGHT_SQUARE: u8 = 0xDB; // similar to U+2610 (☐)
-    pub const DEGREE_SYMBOL: u8 = 0xDF;
-    pub const DIVISION: u8 = 0xFD; // similar to U+00F7 (÷)
-    pub const WHITESPACE2: u8 = 0xFE; // similar to ASCII 0xFF?
-    pub const SQUARE_LARGE_FULL_FILLED: u8 = 0xFF; // similar to ASCII 0xFE
+        // 0x08 seems to print an uppercase A-ring (Å) and advance the cursor.
+        // 0x09 seems to print a lowercase
+        // 0xA6 to 0xAF appear to be symbols of another alphabet/script.
+        // 0XB1 to 0xDA are another script.
+        // 0xDC to 0xDE are another script.
+        // 0xE0 to 0xEF is assorted script, including a-umlaut, some low Greek, and integral
+        // 0xF0 to 0xFC is mostly more Greek.
+
+        // Special Characters
+        pub const RIGHT_ARROW: u8 = 0x7E; // normal tilde in ASCII
+        pub const LEFT_ARROW: u8 = 0x7F; // normally unprintable DEL in ASCII
+        pub const WHITESPACE: u8 = 0xA0;
+        pub const LOWER_OPEN_FULL_STOP: u8 = 0xA1;
+        pub const TOP_LEFT_CORNER: u8 = 0xA2; // similar to Unicode U+231C (⌜)
+        pub const BOTTOM_RIGHT_CORNER: u8 = 0xA3; // similar to Unicode U+231F (⌟)
+        pub const UNFILLED_BASELINE_SQUARE_UNFILLED: u8 = 0xA4; // similar to Unicode U+25AB (▫)
+        pub const SQUARE_BULLET: u8 = 0xA5; // i.e. small filled mid-aligned square, Unicode U+25AA (▪)
+        pub const EN_DASH: u8 = 0xB0;
+        pub const LARGE_FULL_HEIGHT_SQUARE: u8 = 0xDB; // similar to U+2610 (☐)
+        pub const DEGREE_SYMBOL: u8 = 0xDF;
+        pub const DIVISION: u8 = 0xFD; // similar to U+00F7 (÷)
+        pub const WHITESPACE2: u8 = 0xFE; // similar to ASCII 0xFF?
+        pub const SQUARE_LARGE_FULL_FILLED: u8 = 0xFF; // similar to ASCII 0xFE
+    }
 }
 
 #[cfg(test)]
