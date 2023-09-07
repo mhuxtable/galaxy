@@ -5,4 +5,4 @@ pub mod manager;
 mod message;
 
 pub use manager::SerialDevice;
-pub use message::{DeliveryError, SerialMessage, SerialResponseResult, SerialTransaction};
+pub use message::{DeliveryError, SerialMessage, SerialResponseResult};

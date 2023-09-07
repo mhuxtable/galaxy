@@ -114,13 +114,6 @@ pub enum DeliveryError {
 
 pub type SerialResponseResult = Result<SerialMessage, DeliveryError>;
 
-#[derive(Debug)]
-pub struct SerialTransaction {
-    pub command: u8,
-    pub data: Option<Vec<u8>>,
-    pub response_channel: tokio::sync::mpsc::Sender<SerialResponseResult>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

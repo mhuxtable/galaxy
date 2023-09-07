@@ -2,9 +2,8 @@ use log::{debug, error, info};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::mpsc;
 
-use crate::serial::{DeliveryError, SerialDevice, SerialMessage, SerialTransaction};
+use crate::serial::{DeliveryError, SerialDevice, SerialMessage};
 
 // KEYS represents the individual keys on the keypad, with the indices representing the code used
 // to convey key meaning from the device.
@@ -96,22 +95,18 @@ pub struct SerialKeypad {
     // it is necessary to force sending.
     updates: Mutex<KeypadUpdates>,
 
-    update_ch: mpsc::Sender<Result<SerialMessage, DeliveryError>>,
-    monitor_ch: tokio::sync::Mutex<mpsc::Receiver<Result<SerialMessage, DeliveryError>>>,
+    event_ch: Mutex<tokio::sync::broadcast::Sender<Event>>,
 }
 
 impl Default for SerialKeypad {
     fn default() -> Self {
-        let (sender, recv) = mpsc::channel(10);
-
         Self {
             state: RwLock::new(State::default()),
             last_state: RwLock::new(None),
             tamper: Mutex::new(false),
             updates: Mutex::new(KeypadUpdates::default()),
 
-            update_ch: sender,
-            monitor_ch: tokio::sync::Mutex::new(recv),
+            event_ch: Mutex::new(tokio::sync::broadcast::Sender::new(10)),
         }
     }
 }
@@ -153,92 +148,8 @@ impl SerialKeypad {
         *self.tamper.lock().unwrap()
     }
 
-    pub async fn update_worker(&self) {
-        let mut ch = self.monitor_ch.lock().await;
-
-        while let Some(msg) = ch.recv().await {
-            debug!("got update: {:?}", msg);
-
-            let mut last_state = self
-                .last_state
-                .write()
-                .expect("unable to lock last_state for writing");
-
-            let mut tamper = self
-                .tamper
-                .lock()
-                .expect("unable to lock tamper for writing");
-
-            match msg {
-                Ok(reply) => {
-                    match ReplyCommand::try_from(reply.command) {
-                        Ok(ReplyCommand::Initialised) => {
-                            if last_state.is_some() {
-                                // TODO figure out how to handle an unexpected init
-                                error!("Received initialise response for an already initialised keypad");
-                            } else if !validate_additional_data!(reply, 3) {
-                                error!("Received invalid initialisation data from keypad");
-                            } else {
-                                let data = reply.additional_data.unwrap();
-
-                                if (data[0], data[1], data[2]) == (0x08, 0x00, 0x64) {
-                                    info!("Keypad initialised");
-                                    // Cloning current state does not race with external updates to
-                                    // this state, as updates are forced. Normally in the steady
-                                    // state this would be unsafe as a write could race and prevent
-                                    // sending an update to the pad.
-                                    *last_state = Some(self.state.read().unwrap().clone());
-                                    *tamper = false;
-
-                                    let mut updates =
-                                        self.updates.lock().expect("unable to lock update struct");
-
-                                    updates.send_backlight = true;
-                                    updates.send_beeper = true;
-                                    updates.send_key_clicks = true;
-                                    updates.send_screen = true;
-                                }
-                            }
-                        }
-                        Ok(ReplyCommand::Ack) => {
-                            *tamper = false;
-                        }
-                        Ok(ReplyCommand::AckWithKey) => {
-                            if !validate_additional_data!(reply, 1) {
-                                error!("Received AckWithKey with invalid data length");
-                                continue;
-                            }
-
-                            let data = reply.additional_data.unwrap()[0];
-                            let mut updates = self.updates.lock().unwrap();
-
-                            if data == 0x7F {
-                                *tamper = true;
-                            } else {
-                                *tamper = data & 0x40 == 0x40;
-
-                                let key_press = key_to_char(data & 0xF);
-                                info!("Received key press of {} from keypad", key_press);
-
-                                updates.send_key_ack = true;
-                            }
-                        }
-                        Ok(ReplyCommand::BadChecksum) => {
-                            error!("Got BadChecksum from device in response to last update");
-                            // Device marked as offline.
-                            *last_state = None;
-                        }
-                        Err(_) => {
-                            error!("Received unknown reply command {}", reply.command);
-                        }
-                    }
-                }
-                Err(_) => {
-                    // On error, the device is marked as offline and needs to be reinitialised.
-                    *last_state = None;
-                }
-            }
-        }
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Event> {
+        self.event_ch.lock().unwrap().subscribe()
     }
 
     fn next_command(&self) -> (Command, Option<Vec<u8>>) {
@@ -331,7 +242,7 @@ impl SerialKeypad {
 }
 
 impl SerialDevice for SerialKeypad {
-    fn next_message(&self) -> SerialTransaction {
+    fn next_message(&self) -> (u8, Option<Vec<u8>>) {
         let (command, data) = if self
             .last_state
             .read()
@@ -343,10 +254,111 @@ impl SerialDevice for SerialKeypad {
             self.next_command()
         };
 
-        SerialTransaction {
-            command: command.into(),
-            data,
-            response_channel: self.update_ch.clone(),
+        (command.into(), data)
+    }
+
+    fn receive_update(&self, msg: Result<SerialMessage, DeliveryError>) {
+        let ev_ch = self.event_ch.lock().unwrap().clone();
+
+        debug!("got update: {:?}", msg);
+
+        let mut last_state = self
+            .last_state
+            .write()
+            .expect("unable to lock last_state for writing");
+
+        let mut tamper = self
+            .tamper
+            .lock()
+            .expect("unable to lock tamper for writing");
+
+        let mut updates = self
+            .updates
+            .lock()
+            .expect("unable to lock update state for reading");
+
+        match msg {
+            Ok(reply) => {
+                match ReplyCommand::try_from(reply.command) {
+                    Ok(ReplyCommand::Initialised) => {
+                        if last_state.is_some() {
+                            // TODO figure out how to handle an unexpected init
+                            error!(
+                                "Received initialise response for an already initialised keypad"
+                            );
+                        } else if !validate_additional_data!(reply, 3) {
+                            error!("Received invalid initialisation data from keypad");
+                        } else {
+                            let data = reply.additional_data.unwrap();
+
+                            if (data[0], data[1], data[2]) == (0x08, 0x00, 0x64) {
+                                info!("Keypad initialised");
+                                // Cloning current state does not race with external updates to
+                                // this state, as updates are forced. Normally in the steady
+                                // state this would be unsafe as a write could race and prevent
+                                // sending an update to the pad.
+                                *last_state = Some(self.state.read().unwrap().clone());
+                                *tamper = false;
+
+                                updates.send_backlight = true;
+                                updates.send_beeper = true;
+                                updates.send_key_clicks = true;
+                                updates.send_screen = true;
+                            }
+                        }
+                    }
+                    Ok(ReplyCommand::Ack) => {
+                        *tamper = false;
+                    }
+                    Ok(ReplyCommand::AckWithKey) => {
+                        if !validate_additional_data!(reply, 1) {
+                            error!("Received AckWithKey with invalid data length");
+                            // TODO handle this error
+                            return;
+                        }
+
+                        let data = reply.additional_data.unwrap()[0];
+
+                        if data == 0x7F {
+                            *tamper = true;
+                        } else {
+                            *tamper = data & 0x40 == 0x40;
+
+                            // Only handle a key press event if a key acknowledgement is not
+                            // pending. A pending ACK means a reported key press will be a
+                            // duplicate, as no acknowledgement has yet been sent to the panel.
+                            //
+                            // This situation arises because the sequence of events sent back to
+                            // the keypad does not always prioritise sending key acks over other
+                            // user interface indications; key presses stack, which can starve the
+                            // transmission of other updates that provide reassurance of activity
+                            // to the user, e.g. backlight changes, so key press ACKs are treated
+                            // with lower priority.
+                            if !updates.send_key_ack {
+                                let key_press = key_to_char(data & 0xF);
+                                info!("Received key press of {} from keypad", key_press);
+
+                                updates.send_key_ack = true;
+
+                                // TODO deal with this Result
+                                let _ = ev_ch.send(Event(EventType::KeyPress(key_press)));
+                            }
+                        }
+                    }
+                    Ok(ReplyCommand::BadChecksum) => {
+                        error!("Got BadChecksum from device in response to last update");
+                        // Device marked as offline.
+                        *last_state = None;
+                    }
+                    Err(_) => {
+                        error!("Received unknown reply command {}", reply.command);
+                    }
+                }
+            }
+            Err(_) => {
+                // On error, the device is marked as offline and needs to be reinitialised.
+                *last_state = None;
+            }
         }
     }
 }

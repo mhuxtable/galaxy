@@ -6,7 +6,6 @@ use self::queue::BackoffState;
 
 use super::{
     galaxy::{self, bus::ReadError},
-    message::SerialTransaction,
     DeliveryError, SerialMessage,
 };
 
@@ -15,7 +14,8 @@ use super::{
 const LAST_MESSAGE_BAD_CHECKSUM_REPLY_COMMAND: u8 = 0xF2;
 
 pub trait SerialDevice: Send + Sync {
-    fn next_message(&self) -> SerialTransaction;
+    fn next_message(&self) -> (u8, Option<Vec<u8>>);
+    fn receive_update(&self, _: Result<SerialMessage, DeliveryError>);
 }
 
 #[derive(Clone, Copy, Debug, Display, PartialEq)]
@@ -250,18 +250,18 @@ impl SerialManager {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
     async fn poll_device(&mut self, id: u8, reply_buf: &mut [u8]) -> Result<(), DeliveryError> {
         let state = self.devices.get_mut(&id).unwrap();
 
-        let tx = state.device.next_message();
+        let (command, data) = state.device.next_message();
         let data = (SerialMessage {
             recipient_address: id,
-            command: tx.command,
-            additional_data: tx.data,
+            command,
+            additional_data: data,
         })
         .serialise_without_crc();
 
@@ -305,10 +305,7 @@ impl SerialManager {
             }
         }
 
-        tx.response_channel
-            .send(reply_status.clone())
-            .await
-            .expect("unable to reply to bus transaction");
+        state.device.receive_update(reply_status.clone());
 
         if reply_status.is_err() {
             error!(
