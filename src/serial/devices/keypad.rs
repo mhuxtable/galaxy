@@ -638,24 +638,33 @@ mod display {
             // Full update does not require line padding of output lines to display width with
             // whitespace as the display was reset to blank.
 
-            for (&op, line) in [
-                ScreenOpCodes::CURSOR_FIRST_LINE,
-                ScreenOpCodes::CURSOR_SECOND_LINE,
-            ]
-            .iter()
-            .zip(self.lines.iter())
-            {
-                if line.len() > 0 {
-                    data.push(op);
-                    data.extend(line.chars().map(|x| x as u8));
+            let cursor_position = {
+                let mut cursor_position = None;
+
+                for (i, (&op, line)) in [
+                    ScreenOpCodes::CURSOR_FIRST_LINE,
+                    ScreenOpCodes::CURSOR_SECOND_LINE,
+                ]
+                .iter()
+                .zip(self.lines.iter())
+                .enumerate()
+                {
+                    if line.len() > 0 {
+                        data.push(op);
+                        data.extend(line.chars().map(|x| x as u8));
+
+                        cursor_position = Some(i * 0x40 + line.len() + 1);
+                    }
                 }
-            }
+
+                cursor_position
+            };
 
             if self.cursor_style != CursorStyle::None {
                 data.push(ScreenOpCodes::cursor_style_op_code(self.cursor_style));
             }
 
-            (data, Some(0x40 + self.lines[1].len() + 1))
+            (data, cursor_position)
         }
 
         fn partial_update(&self, from: &KeypadDisplayState) -> (Vec<u8>, Option<usize>) {
