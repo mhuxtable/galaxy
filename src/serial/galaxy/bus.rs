@@ -63,15 +63,12 @@ impl Bus {
 
         trace!("output data {:02X?} crc {:02X}", data, crc);
 
-        let mut data = data.to_vec();
-        data.push(crc);
-
         AsyncWriteExt::write_all(&mut self.serial_port, &data)
             .await
             .map_err(ReadError::from)?;
-        // AsyncWriteExt::write_u8(&mut self.serial_port, crc)
-        //     .await
-        //     .map_err(ReadError::from)?;
+        AsyncWriteExt::write_u8(&mut self.serial_port, crc)
+            .await
+            .map_err(ReadError::from)?;
 
         tokio::time::sleep(
             INTERPACKET_GAP
