@@ -15,7 +15,7 @@ const INTERPACKET_GAP: Duration = Duration::from_millis(10);
 const PANEL_ADDRESS: u8 = 0x11;
 
 /// BUS_TIMEOUT is the time after which a read operation for replies from devices gives up.
-const BUS_TIMEOUT: Duration = Duration::from_millis(100);
+const BUS_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub struct Bus {
     serial_port: SerialStream,
