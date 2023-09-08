@@ -87,11 +87,7 @@ impl KeypadManager {
 
         match *state {
             DisplayMode::Idle => {
-                let mut banner = format!("{:<16}", SYSTEM_OWNER);
-                if self.keypad.is_tamper() {
-                    banner.pop();
-                    banner.push('T');
-                }
+                let banner = format!("{:<16}", SYSTEM_OWNER);
 
                 self.keypad.mutate_state(|state| {
                     state.backlight = Backlight::Off;

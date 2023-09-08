@@ -528,7 +528,7 @@ impl From<Beeper> for Vec<u8> {
 }
 
 mod display {
-    use log::debug;
+    use log::{debug, trace};
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub enum CursorStyle {
@@ -609,7 +609,11 @@ mod display {
                 self.update_score(from),
                 3 + self.lines.iter().map(|line| line.len()).sum::<usize>(),
             );
-            debug!("update score: {}  full score: {}", update_score, full_score);
+            trace!(
+                "keypad display strategic update: update score: {}  full score: {}",
+                update_score,
+                full_score
+            );
 
             let (mut update, cursor_position) = if update_score < full_score && update_score < 40 {
                 self.partial_update(from)
