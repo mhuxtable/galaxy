@@ -83,7 +83,7 @@ impl KeypadManager {
     }
 
     fn update_keypad_state(&mut self) {
-        let mut state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap();
 
         match *state {
             DisplayMode::Idle => {
@@ -108,21 +108,17 @@ impl KeypadManager {
             DisplayMode::CodeEntry => {
                 let acc = self.accumulator.lock().unwrap();
 
-                if acc.as_ref().is_some_and(|data| data == "1234E") {
-                    *state = DisplayMode::Menu;
+                let line1 = if acc.is_some() {
+                    acc.clone().unwrap()
                 } else {
-                    let line1 = if acc.is_some() {
-                        acc.clone().unwrap()
-                    } else {
-                        "".to_string()
-                    };
+                    "".to_string()
+                };
 
-                    self.keypad.mutate_state(|state| {
-                        state.backlight = Backlight::On;
-                        state.blink = false;
-                        state.screen.lines = [line1, "".to_string()];
-                    });
-                }
+                self.keypad.mutate_state(|state| {
+                    state.backlight = Backlight::On;
+                    state.blink = false;
+                    state.screen.lines = [line1, "".to_string()];
+                });
             }
             DisplayMode::Menu => {
                 self.keypad.mutate_state(|state| {
@@ -141,6 +137,11 @@ impl KeypadManager {
 
         match event.0 {
             EventType::KeyPress(key) => {
+                if key == 'X' {
+                    *state = DisplayMode::Idle;
+                    return;
+                }
+
                 if *state == DisplayMode::Idle && key != 'X' {
                     let mut s = String::with_capacity(16);
                     s.push(key);
@@ -148,15 +149,11 @@ impl KeypadManager {
                     *state = DisplayMode::CodeEntry;
                     *acc = Some(s);
                 } else if *state == DisplayMode::CodeEntry {
-                    match key {
-                        'X' => {
-                            *state = DisplayMode::Idle;
-                            *acc = None;
-                        }
-                        x => acc.as_mut().unwrap().push(x),
+                    acc.as_mut().unwrap().push(key);
+
+                    if acc.as_ref().unwrap() == "1234E" {
+                        *state = DisplayMode::Menu;
                     }
-                } else if *state == DisplayMode::Menu && key == 'X' {
-                    *state = DisplayMode::Idle;
                 }
             }
         }
