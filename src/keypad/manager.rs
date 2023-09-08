@@ -58,6 +58,9 @@ impl KeypadManager {
             interval_at(start_instant, Duration::from_secs(60))
         };
 
+        // Initial start tick
+        self.update_keypad_state();
+
         loop {
             tokio::select! {
                 _ = time_updater.tick() => {
