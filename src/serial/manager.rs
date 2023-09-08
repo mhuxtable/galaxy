@@ -203,7 +203,7 @@ impl SerialManager {
                     continue;
                 }
 
-                debug!("Polling device {}", id);
+                trace!("Polling device {}", id);
 
                 let result = self.poll_device(*id, &mut reply_buf[..]).await;
 

@@ -1,4 +1,4 @@
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use thiserror::Error;
@@ -223,7 +223,9 @@ impl SerialKeypad {
             data.extend(if updates.send_screen {
                 // Send the full update when sending is forced, to avoid any sync issues between
                 // our state and the screen state.
-                screen.full_update()
+                let (data, _) = screen.full_update();
+
+                data
             } else {
                 screen.strategic_update(&last_state.screen)
             });
@@ -264,7 +266,7 @@ impl SerialDevice for SerialKeypad {
     fn receive_update(&self, msg: Result<SerialMessage, DeliveryError>) {
         let ev_ch = self.event_ch.lock().unwrap().clone();
 
-        debug!("got update: {:?}", msg);
+        trace!("got update: {:?}", msg);
 
         let mut last_state = self
             .last_state
@@ -526,6 +528,8 @@ impl From<Beeper> for Vec<u8> {
 }
 
 mod display {
+    use log::debug;
+
     #[derive(Clone, Copy, Debug, PartialEq)]
     pub enum CursorStyle {
         None,
@@ -550,112 +554,199 @@ mod display {
     #[derive(Clone, Debug, PartialEq)]
     pub struct KeypadDisplayState {
         pub lines: [String; 2],
-        pub cursor_position: u8,
+        // If None, we don't care where the cursor currently is, and we allow it to float. This
+        // reduces the size of update messages.
+        pub cursor_position: Option<u8>,
         pub cursor_style: CursorStyle,
     }
 
     impl KeypadDisplayState {
         pub(super) fn strategic_update(&self, from: &KeypadDisplayState) -> Vec<u8> {
-            // Update methodology:
+            // Display updates can be performed in full or in part. The cost of each is as follows:
             //
-            // 1. If any field other than lines is changed, send the full update.
-            // 2. Otherwise, compute an "update score" as 2*discrete_blocks + chars_diff where
-            //    discrete_blocks is the number of separate blocks of changes, and chars_diff is
-            //    the total number of characters that differ between old and new states. If this
-            //    value is greater than 20, send the full screen state.
+            // full update: reset the display, seek the cursor and output characters to relevant
+            //              positions. We don't need to write whitespace, but sometimes it will be
+            //              cheaper to do so than seeking past it
             //
-            //    (2*discrete_blocks is to allow for the cursor control command to move the cursor,
-            //    which adds overhead.)
-            if self.cursor_position != from.cursor_position
-                || self.cursor_style != from.cursor_style
-            {
-                self.full_update()
-            } else if self.update_score(from) <= 20 {
+            // partial update: seek cursor to relevant position (two bytes), write out characters
+            //                 (byte per character), repeat for further changed blocks. Also reset
+            //                 cursor position and style if required.
+            //
+            // It is preferred to do partial updates where efficient, but in some cases a full
+            // update will be more prudent on bus time.
+            //
+            // Update score is computed as a heuristic to determine the mechanism used for screen
+            // update. This is determined as 2*blocks_changed+chars_diff. blocks_changed is
+            // computed by splitting the string into blocks of non-contiguous modified characters,
+            // starting a new block when matching characters are identified.
+            //
+            // A full update is performed if the update score is greater than the cost of a full
+            // update of the display, computed as 1 (display reset cost) + 2 (start of line seek
+            // cost, 1 per line) + sum(unpadded_line_length).
+            //
+            // The cost of updating cursor positions is omitted as it must be performed on either
+            // update style.
+            //
+            // The cost of updating the cursor style is only included if this has changed.
+            //
+            // This heuristic will overpredict the cost of partial updates relative to the most
+            // efficient algorithm. This arises because the cost of seeking the cursor to the start
+            // of a block is 2 bytes, meaning update blocks separated by at most one unchanged
+            // character can be more efficiently updated by fusing the blocks and writing out the
+            // unchanged character rather than seeking the cursor:
+            //
+            // Before:  AABBCC
+            // After:   ABBCCC
+            // Changes:  ^ ^
+            //
+            // Update score          = 2 * 2 blocks + 2 chars = 6
+            // Most efficient update = seek 0x1 (cost 2) + print BBC (cost 3) = 5
+            //
+            // This situation is ignored for heuristic purposes but is accounted for in the partial
+            // update algorithm, which does fuse blocks together where it yields an efficiency
+            // saving in the generated update for the bus.
+            let (update_score, full_score) = (
+                self.update_score(from),
+                3 + self.lines.iter().map(|line| line.len()).sum::<usize>(),
+            );
+            debug!("update score: {}  full score: {}", update_score, full_score);
+
+            let (mut update, cursor_position) = if update_score < full_score && update_score < 40 {
                 self.partial_update(from)
             } else {
                 self.full_update()
-            }
-        }
+            };
 
-        pub fn full_update(&self) -> Vec<u8> {
-            let mut data = vec![
-                ScreenOpCodes::DISPLAY_RESET,
-                ScreenOpCodes::CURSOR_FIRST_LINE,
-                ScreenOpCodes::CURSOR_HIDDEN,
-            ];
-            data.extend(format!("{:<16}", self.lines[0]).chars().map(|x| x as u8));
-            data.push(ScreenOpCodes::CURSOR_SECOND_LINE);
-            data.extend(format!("{:<16}", self.lines[1]).chars().map(|x| x as u8));
-
-            if let Some(cursor_style) = match self.cursor_style {
-                CursorStyle::Block => Some(ScreenOpCodes::CURSOR_BLOCK_STYLE),
-                CursorStyle::Underline => Some(ScreenOpCodes::CURSOR_UNDERLINE_STYLE),
-                _ => None,
-            } {
-                data.push(cursor_style);
-            }
-
-            data.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, self.cursor_position]);
-
-            data
-        }
-
-        fn partial_update(&self, from: &KeypadDisplayState) -> Vec<u8> {
-            let from = from.lines.iter().map(|line| pad_string_iterator(16, &line));
-            let to = self.lines.iter().map(|line| pad_string_iterator(16, &line));
-
-            let mut data = vec![];
-            let mut cursor_position = None;
-
-            for (i, (from, to)) in from.zip(to).enumerate() {
-                for (j, (a, b)) in from.zip(to).enumerate() {
-                    let offset = i * 0x40 + j;
-
-                    if a != b {
-                        if cursor_position.is_none()
-                            || cursor_position.is_some_and(|pos| pos != offset)
-                        {
-                            data.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, offset as u8]);
-                        }
-
-                        data.push(b as u8);
-                        cursor_position = Some(offset + 1);
-                    }
+            if let Some(offset) = self.cursor_position {
+                if cursor_position.is_none()
+                    || cursor_position.is_some_and(|cur_pos| cur_pos as u8 != offset)
+                {
+                    update.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, offset]);
                 }
             }
 
-            // Always reset the cursor to the expected position.
-            //
-            // TODO turn the cursor_position into an Option so this can be skipped when the cursor
-            // is able to float.
-            data.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, self.cursor_position]);
+            update
+        }
 
-            data
+        pub(super) fn full_update(&self) -> (Vec<u8>, Option<usize>) {
+            let mut data = vec![ScreenOpCodes::DISPLAY_RESET, ScreenOpCodes::CURSOR_HIDDEN];
+
+            // Full update does not require line padding of output lines to display width with
+            // whitespace as the display was reset to blank.
+
+            for (&op, line) in [
+                ScreenOpCodes::CURSOR_FIRST_LINE,
+                ScreenOpCodes::CURSOR_SECOND_LINE,
+            ]
+            .iter()
+            .zip(self.lines.iter())
+            {
+                if line.len() > 0 {
+                    data.push(op);
+                    data.extend(line.chars().map(|x| x as u8));
+                }
+            }
+
+            if self.cursor_style != CursorStyle::None {
+                data.push(ScreenOpCodes::cursor_style_op_code(self.cursor_style));
+            }
+
+            (data, Some(0x40 + self.lines[1].len() + 1))
+        }
+
+        fn partial_update(&self, from: &KeypadDisplayState) -> (Vec<u8>, Option<usize>) {
+            let mut data = vec![];
+
+            let cursor_final_position = {
+                let from = from.lines.iter().map(|line| pad_string_iterator(16, &line));
+                let to = self.lines.iter().map(|line| pad_string_iterator(16, &line));
+
+                let mut cursor_position = None;
+
+                const START_OF_LINE_SEEK_OP_CODES: [u8; 2] = [
+                    ScreenOpCodes::CURSOR_FIRST_LINE,
+                    ScreenOpCodes::CURSOR_SECOND_LINE,
+                ];
+
+                for (i, (from, to)) in from.zip(to).enumerate() {
+                    // skipped_char is used to 'fuse' changed blocks separated by at most one
+                    // unchanged character. It is more efficient to emit the unchanged character as
+                    // a data byte in order to advance the cursor to process a subsequent changed
+                    // character than it is to seek the cursor (1 byte vs. 2 bytes).
+                    let mut skipped_char = None;
+
+                    for (j, (a, b)) in from.zip(to).enumerate() {
+                        let offset = i * 0x40 + j;
+
+                        if a != b {
+                            // The difference between the current cursor position and the location
+                            // required to update the current character.
+                            let cursor_diff =
+                                cursor_position.map_or(usize::MAX, |cur_pos| offset - cur_pos);
+
+                            // if cursor_diff is 0, it is already in the correct place, so no
+                            // action is required.
+                            if cursor_diff == 1 && skipped_char.is_some() {
+                                data.push(skipped_char.unwrap() as u8);
+                            } else if cursor_diff >= 2 {
+                                if j == 0 {
+                                    data.push(START_OF_LINE_SEEK_OP_CODES[i]);
+                                } else {
+                                    data.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, offset as u8]);
+                                };
+                            };
+
+                            skipped_char = None;
+
+                            data.push(b as u8);
+                            cursor_position = Some(offset + 1);
+                        } else {
+                            skipped_char = Some(b);
+                        }
+                    }
+                }
+
+                cursor_position
+            };
+
+            if from.cursor_style != self.cursor_style {
+                data.push(ScreenOpCodes::cursor_style_op_code(self.cursor_style))
+            }
+
+            (data, cursor_final_position)
         }
 
         fn update_score(&self, from: &KeypadDisplayState) -> usize {
-            let from_iter = pad_string_iterator(16, from.lines[0].as_str())
-                .chain(pad_string_iterator(16, from.lines[1].as_str()));
-            let to_iter = pad_string_iterator(16, self.lines[0].as_str())
-                .chain(pad_string_iterator(16, self.lines[1].as_str()));
+            let lines_score = {
+                let from_iter = pad_string_iterator(16, from.lines[0].as_str())
+                    .chain(pad_string_iterator(16, from.lines[1].as_str()));
+                let to_iter = pad_string_iterator(16, self.lines[0].as_str())
+                    .chain(pad_string_iterator(16, self.lines[1].as_str()));
 
-            let mut discrete_blocks = 0;
-            let mut chars_diff = 0;
-            let mut in_block = false;
+                let mut discrete_blocks = 0;
+                let mut chars_diff = 0;
+                let mut in_block = false;
 
-            for (a, b) in from_iter.zip(to_iter) {
-                if a != b {
-                    chars_diff += 1;
-                    if !in_block {
-                        discrete_blocks += 1;
-                        in_block = true;
+                for (a, b) in from_iter.zip(to_iter) {
+                    if a != b {
+                        chars_diff += 1;
+                        if !in_block {
+                            discrete_blocks += 1;
+                            in_block = true;
+                        }
+                    } else {
+                        in_block = false;
                     }
-                } else {
-                    in_block = false;
                 }
-            }
 
-            2 * discrete_blocks + chars_diff
+                2 * discrete_blocks + chars_diff
+            };
+
+            let cursor_score = (from.cursor_style != self.cursor_style)
+                .then_some(1)
+                .unwrap_or(0);
+
+            lines_score + cursor_score
         }
     }
 
@@ -666,7 +757,7 @@ mod display {
                     String::from("    ********    "),
                     String::from("Panel booting up"),
                 ],
-                cursor_position: 0x0,
+                cursor_position: None,
                 cursor_style: CursorStyle::None,
             }
         }
@@ -722,6 +813,76 @@ mod display {
         pub const DIVISION: u8 = 0xFD; // similar to U+00F7 (÷)
         pub const WHITESPACE2: u8 = 0xFE; // similar to ASCII 0xFF?
         pub const SQUARE_LARGE_FULL_FILLED: u8 = 0xFF; // similar to ASCII 0xFE
+
+        pub fn cursor_style_op_code(cursor_style: CursorStyle) -> u8 {
+            match cursor_style {
+                CursorStyle::None => ScreenOpCodes::CURSOR_HIDDEN,
+                CursorStyle::Block => ScreenOpCodes::CURSOR_BLOCK_STYLE,
+                CursorStyle::Underline => ScreenOpCodes::CURSOR_UNDERLINE_STYLE,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        /// Test screen doing a full update, from a full screen to a very empty screen.
+        fn screen_simulate_full_update() {
+            let before = KeypadDisplayState {
+                lines: ["VERY LONG LINE".to_string(), "SOME MORE TEXT".to_string()],
+                cursor_style: CursorStyle::Block,
+                cursor_position: Some(0x45),
+            };
+            let after = KeypadDisplayState {
+                lines: ["A".to_string(), "".to_string()],
+                cursor_style: CursorStyle::Block,
+                cursor_position: Some(0x45),
+            };
+
+            let update = after.strategic_update(&before);
+
+            assert_eq!(update, vec![0x17, 0x07, 0x01, 'A' as u8, 0x06, 0x03, 0x45]);
+        }
+
+        #[test]
+        /// Test screen doing a partial update, with very disparate blocks of updated text spread
+        /// across the screen. The updates are constructed so as to test block fusing (differring
+        /// characters separated by a single unchanged character), start of line cursor seek
+        /// optimisation (use the special commands to jump to 0x0 or 0x40 for a 1 byte reduction)
+        /// and sequential character updates (only seek to start of a block, not charaters within a
+        /// block as the cursor is advanced automatically).
+        fn screen_simulate_partial_update() {
+            let before = KeypadDisplayState {
+                lines: [
+                    "ABCD1234EFGH5678".to_string(),
+                    "0123456789ABCDEF".to_string(),
+                ],
+                cursor_style: CursorStyle::None,
+                cursor_position: None,
+            };
+            let after = KeypadDisplayState {
+                lines: [
+                    "ABCCC234EEGH8765".to_string(),
+                    "1023456789ABCDDD".to_string(),
+                ],
+                cursor_style: CursorStyle::None,
+                cursor_position: None,
+            };
+
+            let update = after.strategic_update(&before);
+            let expect = vec![
+                0x03, 0x03, 0x43, 0x43, 0x03, 0x09, 0x45, 0x03, 0x0C, 0x38, 0x37, 0x36, 0x35, 0x02,
+                0x31, 0x30, 0x03, 0x4E, 0x44, 0x44,
+            ];
+
+            assert_eq!(
+                update, expect,
+                "got: {:02X?} expect: {:02X?}",
+                update, expect
+            );
+        }
     }
 }
 
