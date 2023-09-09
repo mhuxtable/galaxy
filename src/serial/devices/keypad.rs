@@ -628,9 +628,7 @@ mod display {
                 };
 
             if let Some(offset) = self.cursor_position {
-                if cursor_position.is_none()
-                    || cursor_position.is_some_and(|cur_pos| cur_pos as u8 != offset)
-                {
+                if cursor_position.map_or(true, |cur_pos| cur_pos as u8 != offset) {
                     update.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, offset]);
                 }
             }
