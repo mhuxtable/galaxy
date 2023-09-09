@@ -704,9 +704,13 @@ mod display {
                             // if cursor_diff is 0, it is already in the correct place, so no
                             // action is required.
                             if cursor_diff == 1 && skipped_char.is_some() {
+                                // The changed blocks can be 'fused' by pushing the skipped
+                                // character, saving a byte relative to seeking.
                                 data.push(skipped_char.unwrap() as u8);
                             } else if cursor_diff >= 2 {
                                 if j == 0 {
+                                    // Start of block can use the special start of block op code,
+                                    // saving 1 byte vs. seeking.
                                     data.push(START_OF_LINE_SEEK_OP_CODES[i]);
                                 } else {
                                     data.extend([ScreenOpCodes::CURSOR_SEEK_BYTE, offset as u8]);
