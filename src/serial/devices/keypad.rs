@@ -637,7 +637,7 @@ mod display {
         }
 
         pub(super) fn full_update(&self) -> (Vec<u8>, Option<usize>) {
-            let mut data = vec![ScreenOpCodes::DISPLAY_RESET, ScreenOpCodes::CURSOR_HIDDEN];
+            let mut data = vec![ScreenOpCodes::DISPLAY_RESET];
 
             // Full update does not require line padding of output lines to display width with
             // whitespace as the display was reset to blank.
@@ -664,9 +664,9 @@ mod display {
                 cursor_position
             };
 
-            if self.cursor_style != CursorStyle::None {
-                data.push(ScreenOpCodes::cursor_style_op_code(self.cursor_style));
-            }
+            // The cursor must be cleared manually in all cases, even if hidden, as display reset
+            // does not clear it.
+            data.push(ScreenOpCodes::cursor_style_op_code(self.cursor_style));
 
             (data, cursor_position)
         }
