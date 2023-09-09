@@ -615,11 +615,17 @@ mod display {
                 full_score
             );
 
-            let (mut update, cursor_position) = if update_score < full_score && update_score < 40 {
-                self.partial_update(from)
-            } else {
-                self.full_update()
-            };
+            // Keypads have a maximum message length they will process which is determined by bus
+            // timing and the period it will consume data from the bus. This is about 46 symbols;
+            // shorten to 40 to allow for the envelope data, plus a small margin.
+            const MAX_PARTIAL_UPDATE_SCORE: usize = 40;
+
+            let (mut update, cursor_position) =
+                if update_score < full_score && update_score < MAX_PARTIAL_UPDATE_SCORE {
+                    self.partial_update(from)
+                } else {
+                    self.full_update()
+                };
 
             if let Some(offset) = self.cursor_position {
                 if cursor_position.is_none()
