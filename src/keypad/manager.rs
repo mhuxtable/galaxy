@@ -87,13 +87,11 @@ impl KeypadManager {
 
     fn update_keypad_state(&mut self) {
         let state = self.state.lock().unwrap();
+        let banner = format!("{:<16}", SYSTEM_OWNER);
 
         match *state {
             DisplayMode::Idle => {
-                let banner = format!("{:<16}", SYSTEM_OWNER);
-
                 self.keypad.mutate_state(|state| {
-                    state.backlight = Backlight::Off;
                     state.blink = false;
                     state.screen.lines = [
                         banner,
@@ -105,6 +103,11 @@ impl KeypadManager {
                 });
             }
             DisplayMode::CodeEntry => {
+                self.keypad.mutate_state(|state| {
+                    state.backlight = Backlight::On;
+                    state.screen.lines = ["".to_string(), "".to_string()];
+                });
+
                 let acc = self.accumulator.lock().unwrap();
 
                 let line1 = if acc.is_some() {
@@ -114,7 +117,6 @@ impl KeypadManager {
                 };
 
                 self.keypad.mutate_state(|state| {
-                    state.backlight = Backlight::On;
                     state.blink = false;
                     state.screen.lines = [line1, "".to_string()];
                 });
