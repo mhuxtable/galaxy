@@ -313,9 +313,10 @@ impl SerialManager {
                 id, reply_status
             );
         } else {
-            debug!(
+            trace!(
                 "device {} has message delivery result {:?}",
-                id, reply_status
+                id,
+                reply_status
             );
         }
 

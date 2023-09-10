@@ -66,6 +66,8 @@ impl KeypadManager {
                     self.update_keypad_state();
                 }
                 msg = event_ch.recv() => {
+                    debug!("Received keypad event: {:?}", msg);
+
                     match msg {
                         Ok(event) => {
                             let new_state = self.process_event(event);
