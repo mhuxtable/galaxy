@@ -39,30 +39,7 @@ impl KeypadManager {
 
     pub async fn run(&mut self) -> Result<(), Box<dyn Error + Sync + Send>> {
         let mut event_ch = self.keypad.subscribe_events();
-
-        let mut time_updater = {
-            use std::time::SystemTime;
-            use tokio::time::{interval_at, Instant};
-
-            let now = SystemTime::now();
-            let next_minute = (now
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-                / 60
-                + 1)
-                * 60;
-            let start_instant = Instant::now()
-                + Duration::from_secs(
-                    next_minute
-                        - now
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs(),
-                );
-
-            interval_at(start_instant, Duration::from_secs(60))
-        };
+        let mut time_updater_interval = interval_at_next_minute();
 
         // TODO stop the responder when it's time to shut down
         let (_backlight_responder_token, backlight_state_tx) = {
@@ -85,7 +62,7 @@ impl KeypadManager {
 
         loop {
             tokio::select! {
-                _ = time_updater.tick() => {
+                _ = time_updater_interval.tick() => {
                     self.update_keypad_state();
                 }
                 msg = event_ch.recv() => {
@@ -255,4 +232,28 @@ impl BacklightResponder {
 
         Ok(())
     }
+}
+
+fn interval_at_next_minute() -> Interval {
+    use std::time::SystemTime;
+    use tokio::time::{interval_at, Instant};
+
+    let now = SystemTime::now();
+    let next_minute = (now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        / 60
+        + 1)
+        * 60;
+    let start_instant = Instant::now()
+        + Duration::from_secs(
+            next_minute
+                - now
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+        );
+
+    interval_at(start_instant, Duration::from_secs(60))
 }
